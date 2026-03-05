@@ -3,16 +3,22 @@ app.py — ReefSense AHP Scoring API
 FastAPI service deployed on Hugging Face Spaces.
 
 Endpoints:
-  GET  /health                — service health check
-  POST /calculate-area        — calculate nursery floor area from dimensions
-  POST /score                 — score and rank candidate points (AHP)
-  POST /recalculate-all       — recalculate scores for all points after a change
+  GET  /health                      — service health check
+  POST /calculate-area              — calculate nursery floor area from dimensions
+  POST /score                       — score and rank candidate points (AHP)
+  POST /recalculate-all             — recalculate scores for all points after a change
+
+  GET  /temperature/records         — all merged depth-band temperature records
+  GET  /temperature/records/{id}    — single temperature record by ID
+  GET  /temperature/stats           — date range, row count, available depth bands
 """
 
+import csv
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -22,8 +28,8 @@ import scoring
 
 app = FastAPI(
     title="ReefSense AHP Scoring API",
-    description="AHP-based nursery placement scoring for the ReefSense DSS.",
-    version="1.0.0",
+    description="AHP-based nursery placement scoring + sensor temperature data for the ReefSense DSS.",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -32,6 +38,78 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Load CSV temperature data on startup ──────────────────────────────────────
+
+DATA_DIR = Path(__file__).parent / "data"
+
+
+def _read_csv(filename: str) -> List[Dict[str, str]]:
+    """Read a CSV file from the data/ directory and return list of row dicts."""
+    path = DATA_DIR / filename
+    if not path.exists():
+        raise FileNotFoundError(f"CSV not found: {path}")
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _f(val: str) -> Optional[float]:
+    """Parse float or return None."""
+    try:
+        return float(val) if val and val.strip() else None
+    except ValueError:
+        return None
+
+
+def _build_temperature_records() -> List[Dict[str, Any]]:
+    """
+    Merge the three depth-band CSV files by Date+Time.
+    Returns a list of records each containing readings from all three bands.
+    Shared environmental columns (air_temp, wind_speed, salinity, light_lux)
+    are taken from the 0-3m surface file.
+    """
+    rows_0_3  = _read_csv("coral_0_3m.csv")
+    rows_3_7  = _read_csv("coral_3_7m.csv")
+    rows_7_10 = _read_csv("coral_7_10m.csv")
+
+    # Build lookup maps for 3-7m and 7-10m by Date|Time key
+    map_3_7  = {f"{r['Date']}|{r['Time']}": r for r in rows_3_7}
+    map_7_10 = {f"{r['Date']}|{r['Time']}": r for r in rows_7_10}
+
+    records = []
+    for idx, r0 in enumerate(rows_0_3):
+        key  = f"{r0['Date']}|{r0['Time']}"
+        r3   = map_3_7.get(key, {})
+        r10  = map_7_10.get(key, {})
+
+        records.append({
+            "id":         idx + 1,
+            "date":       r0.get("Date", ""),
+            "time":       r0.get("Time", ""),
+            "latitude":   _f(r0.get("latitude", "")),
+            "longitude":  _f(r0.get("longitude", "")),
+            # Water temperatures per depth band
+            "temp3m":     _f(r0.get("water_temp", "")),
+            "temp7m":     _f(r3.get("water_temp", "")),
+            "temp10m":    _f(r10.get("water_temp", "")),
+            # Surface environmental readings (from 0-3m file)
+            "light_lux":  _f(r0.get("light_lux", "")),
+            "air_temp":   _f(r0.get("air_temp", "")),
+            "wind_speed": _f(r0.get("wind_speed", "")),
+            "salinity":   _f(r0.get("salinity", "")),
+        })
+
+    return records
+
+
+# Load once at startup — stays in memory for the lifetime of the process
+try:
+    TEMPERATURE_RECORDS: List[Dict[str, Any]] = _build_temperature_records()
+    print(f"[Startup] Loaded {len(TEMPERATURE_RECORDS)} merged temperature records.")
+except Exception as _e:
+    TEMPERATURE_RECORDS = []
+    print(f"[Startup] WARNING — could not load temperature CSVs: {_e}")
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -53,13 +131,14 @@ class RecalculateRequest(BaseModel):
     points: List[Dict[str, Any]]
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── AHP Routes ────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
     return {
         "status":    "ok",
         "service":   "reefsense-scoring",
+        "temperature_records_loaded": len(TEMPERATURE_RECORDS),
         "weights": {
             "standard":  scoring.W_STANDARD,
             "dimension": scoring.W_DIMENSION,
@@ -112,6 +191,70 @@ def recalculate_all(req: RecalculateRequest):
     return {
         "count":  len(results),
         "scores": results,
+    }
+
+
+# ── Temperature Data Routes ───────────────────────────────────────────────────
+
+@app.get("/temperature/records")
+def get_temperature_records(
+    date:  Optional[str] = Query(None, description="Filter by date (YYYY-MM-DD)"),
+    page:  int           = Query(1,    ge=1,   description="Page number (1-based)"),
+    limit: int           = Query(100,  ge=1, le=1500, description="Records per page"),
+):
+    """
+    Return merged depth-band temperature records from the three CSV files.
+    All 1463 readings are available (6-hourly, Jan–Dec 2024).
+
+    Each record includes:
+      temp3m, temp7m, temp10m — water temperatures at each depth band
+      light_lux, air_temp, wind_speed, salinity — surface environmental readings
+
+    Supports optional date filtering and pagination.
+    """
+    data = TEMPERATURE_RECORDS
+
+    # Optional date filter
+    if date:
+        data = [r for r in data if r["date"] == date]
+
+    total = len(data)
+
+    # Pagination
+    start  = (page - 1) * limit
+    paged  = data[start: start + limit]
+
+    return {
+        "total":  total,
+        "page":   page,
+        "limit":  limit,
+        "count":  len(paged),
+        "records": paged,
+    }
+
+
+@app.get("/temperature/records/{record_id}")
+def get_temperature_record(record_id: int):
+    """Return a single temperature record by its 1-based ID."""
+    if record_id < 1 or record_id > len(TEMPERATURE_RECORDS):
+        raise HTTPException(status_code=404, detail="Record not found")
+    return TEMPERATURE_RECORDS[record_id - 1]
+
+
+@app.get("/temperature/stats")
+def get_temperature_stats():
+    """Return summary statistics for the loaded temperature dataset."""
+    if not TEMPERATURE_RECORDS:
+        return {"total": 0, "date_range": None}
+
+    dates = [r["date"] for r in TEMPERATURE_RECORDS if r["date"]]
+    return {
+        "total":      len(TEMPERATURE_RECORDS),
+        "date_from":  min(dates) if dates else None,
+        "date_to":    max(dates) if dates else None,
+        "depth_bands": ["0-3m", "3-7m", "7-10m"],
+        "columns":    ["temp3m", "temp7m", "temp10m",
+                       "light_lux", "air_temp", "wind_speed", "salinity"],
     }
 
 
