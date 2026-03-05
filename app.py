@@ -11,11 +11,15 @@ Endpoints:
   GET  /temperature/records         — all merged depth-band temperature records
   GET  /temperature/records/{id}    — single temperature record by ID
   GET  /temperature/stats           — date range, row count, available depth bands
+
+Sensor CSV data is fetched at startup from the HuggingFace Dataset:
+  https://huggingface.co/datasets/senithudara/reefsense-coral-sensor-data
 """
 
 import csv
+import io
 import os
-from pathlib import Path
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -40,18 +44,26 @@ app.add_middleware(
 )
 
 
-# ── Load CSV temperature data on startup ──────────────────────────────────────
+# ── Load CSV temperature data from HF Dataset on startup ──────────────────────
 
-DATA_DIR = Path(__file__).parent / "data"
+HF_DATASET_BASE = (
+    "https://huggingface.co/datasets/senithudara/reefsense-coral-sensor-data"
+    "/resolve/main"
+)
+
+CSV_URLS = {
+    "0_3m":  f"{HF_DATASET_BASE}/coral_0_3m.csv",
+    "3_7m":  f"{HF_DATASET_BASE}/coral_3_7m.csv",
+    "7_10m": f"{HF_DATASET_BASE}/coral_7_10m.csv",
+}
 
 
-def _read_csv(filename: str) -> List[Dict[str, str]]:
-    """Read a CSV file from the data/ directory and return list of row dicts."""
-    path = DATA_DIR / filename
-    if not path.exists():
-        raise FileNotFoundError(f"CSV not found: {path}")
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+def _fetch_csv(url: str) -> List[Dict[str, str]]:
+    """Download a CSV from a URL and return list of row dicts."""
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        content = resp.read().decode("utf-8")
+    reader = csv.DictReader(io.StringIO(content))
+    return list(reader)
 
 
 def _f(val: str) -> Optional[float]:
@@ -64,14 +76,16 @@ def _f(val: str) -> Optional[float]:
 
 def _build_temperature_records() -> List[Dict[str, Any]]:
     """
-    Merge the three depth-band CSV files by Date+Time.
+    Fetch the three depth-band CSV files from the HF Dataset and merge by Date+Time.
     Returns a list of records each containing readings from all three bands.
     Shared environmental columns (air_temp, wind_speed, salinity, light_lux)
     are taken from the 0-3m surface file.
     """
-    rows_0_3  = _read_csv("coral_0_3m.csv")
-    rows_3_7  = _read_csv("coral_3_7m.csv")
-    rows_7_10 = _read_csv("coral_7_10m.csv")
+    print("[Startup] Downloading sensor CSV files from HF Dataset...")
+    rows_0_3  = _fetch_csv(CSV_URLS["0_3m"])
+    rows_3_7  = _fetch_csv(CSV_URLS["3_7m"])
+    rows_7_10 = _fetch_csv(CSV_URLS["7_10m"])
+    print(f"[Startup] Downloaded: {len(rows_0_3)} / {len(rows_3_7)} / {len(rows_7_10)} rows")
 
     # Build lookup maps for 3-7m and 7-10m by Date|Time key
     map_3_7  = {f"{r['Date']}|{r['Time']}": r for r in rows_3_7}
@@ -221,14 +235,14 @@ def get_temperature_records(
     total = len(data)
 
     # Pagination
-    start  = (page - 1) * limit
-    paged  = data[start: start + limit]
+    start = (page - 1) * limit
+    paged = data[start: start + limit]
 
     return {
-        "total":  total,
-        "page":   page,
-        "limit":  limit,
-        "count":  len(paged),
+        "total":   total,
+        "page":    page,
+        "limit":   limit,
+        "count":   len(paged),
         "records": paged,
     }
 
@@ -249,12 +263,13 @@ def get_temperature_stats():
 
     dates = [r["date"] for r in TEMPERATURE_RECORDS if r["date"]]
     return {
-        "total":      len(TEMPERATURE_RECORDS),
-        "date_from":  min(dates) if dates else None,
-        "date_to":    max(dates) if dates else None,
+        "total":       len(TEMPERATURE_RECORDS),
+        "date_from":   min(dates) if dates else None,
+        "date_to":     max(dates) if dates else None,
         "depth_bands": ["0-3m", "3-7m", "7-10m"],
-        "columns":    ["temp3m", "temp7m", "temp10m",
-                       "light_lux", "air_temp", "wind_speed", "salinity"],
+        "columns":     ["temp3m", "temp7m", "temp10m",
+                        "light_lux", "air_temp", "wind_speed", "salinity"],
+        "dataset_url": "https://huggingface.co/datasets/senithudara/reefsense-coral-sensor-data",
     }
 
 
