@@ -10,7 +10,7 @@ Two weight modes:
 import math
 from typing import Any, Dict, List, Optional
 
-# ── AHP weights (each set sums to 1.0) ────────────────────────────────────────
+# ── AHP weights (each set sums to 1.0) 
 
 W_STANDARD: Dict[str, float] = {
     "current": 0.35,   # light score  (depth-band derived)
@@ -38,7 +38,7 @@ DEPTH_BAND_SCORES: Dict[str, Dict[str, float]] = {
 MIN_SPACING_M = 2  # nurseries must be at least 2 m apart
 
 
-# ── Normalisation helpers ──────────────────────────────────────────────────────
+# ── Normalisation helpers 
 
 def norm_higher(values: List[float]) -> List[float]:
     """Normalise so the highest value → 1.0, lowest → 0.0."""
@@ -56,7 +56,7 @@ def norm_lower(values: List[float]) -> List[float]:
     return [(mx - v) / (mx - mn) for v in values]
 
 
-# ── Dimension helpers ──────────────────────────────────────────────────────────
+# ── Dimension helpers 
 
 def calculate_required_area(
     nursery_type: str,
@@ -83,7 +83,7 @@ def calculate_required_area(
         return math.pi * radius_m ** 2
 
 
-# ── Core scoring ───────────────────────────────────────────────────────────────
+# ── Core scoring 
 
 def score_points(
     points: List[Dict[str, Any]],
