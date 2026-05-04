@@ -1,0 +1,30 @@
+name: Sync to Hugging Face Spaces
+
+on:
+  push:
+    branches:
+      - main  # triggers on every push to main
+
+jobs:
+  sync-to-hf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout GitHub repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # full history needed for a clean push
+          lfs: true           # include any Git LFS files
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git config user.email "ci@github-actions"
+          git config user.name  "GitHub Actions"
+
+          # Add the HF Space as a remote
+          git remote add hf https://senithudara:${HF_TOKEN}@huggingface.co/spaces/senithudara/reefsense-scoring-api
+
+          # Force-push current branch to HF Space main
+          git push hf HEAD:main --force
